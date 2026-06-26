@@ -16,37 +16,26 @@ PYBIN=${PYBIN:-python}
 # (Hopper-only, build from source from Dao-AILab/flash-attention hopper subdir).
 ATTN_IMPL=${ATTN_IMPL:-flash_attention_2}
 
-export PYTHONUNBUFFERED=1
-export HYDRA_FULL_ERROR=1
-export RAY_DEDUP_LOGS=0
-export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
-# Default to ONLINE (auto-download missing models). Set OFFLINE=1 to disable
-# (e.g. on isolated clusters where the model is pre-staged in HF_HOME).
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
-export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}"
-export TORCH_COMPILE_DISABLE=1
-export VLLM_DISABLE_COMPILE_CACHE=1
-# Disable torch.inductor's on-disk cache too. Without this, a prior run that
-# baked in `flashinfer_trtllm_fused_allreduce_norm` (when fuse_allreduce_rms
-# was on) reuses that compiled graph and asserts during warm-up:
-#   AssertionError: Flashinfer workspace must be initialized when using flashinfer
-# VLLM_DISABLE_COMPILE_CACHE only covers vLLM's own cache, not inductor's.
-export TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
-export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$HOME/.cache/vllm}"
-export VLLM_LOGGING_LEVEL=INFO
+# Recipe-required env vars (skyrl + arctic). Generic debug knobs
+# (HYDRA_FULL_ERROR, RAY_DEDUP_LOGS, VLLM_LOGGING_LEVEL, etc.) are left to
+# the user's shell. Offline HF caches are off by default — set
+# HF_HUB_OFFLINE=1 when running on isolated nodes with pre-staged weights.
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
+# Inductor on-disk cache must be disabled: a prior run that baked in
+# `flashinfer_trtllm_fused_allreduce_norm` (when fuse_allreduce_rms was on)
+# will replay that compiled graph and assert during warm-up with
+# "Flashinfer workspace must be initialized when using flashinfer".
+export TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
+# Arctic weight-sync knobs (see arctic_platform docs):
+#   LOW_MEM=0       — fast path; flip to 1 only on memory pressure.
+#   STRICT_NAMES=0  — bypass tied-buffer name check (safe no-op on Qwen3-32B).
 export ARCTIC_CUDA_IPC_LOW_MEM=0
-# 32B + tie_word_embeddings is False, but keep the bypass on — it's a no-op
-# when names match and a safety net if upstream Qwen3 adds new tied buffers.
 export ARCTIC_WEIGHT_SYNC_STRICT_NAMES=0
-# verl 32B recipe ships this; helps with the 32B optimizer-state CPU offload churn.
+# Helps with the 32B optimizer-state CPU offload churn.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# WandB — set WANDB_API_KEY in your environment to enable logging; override
-# WANDB_PROJECT to write to a different project.
-export WANDB_API_KEY="${WANDB_API_KEY:-}"
+# WandB — set WANDB_API_KEY in your shell to enable logging.
 export WANDB_PROJECT="${WANDB_PROJECT:-skyrl_arctic_rl}"
-export WANDB_DISABLE_CODE=True
 
 # Model: pass the HF id by default — transformers/vLLM auto-download to
 # HF_HOME on first use. If you've pre-staged the snapshot (multi-node
@@ -88,35 +77,32 @@ TP_SIZE=4
 NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 
 # Inference knobs forwarded to ArcticAsyncEngineArgs via
-# trainer.arctic_rl.arctic_inference_config (raw passthrough):
-#   FCA: forest_cascade_attn_configs={} + cudagraph_mode=PIECEWISE.
-#   pass_config.fuse_allreduce_rms=false: with 8 replicas x TP=4 colocated
-#        2-per-node, the two co-located replicas race for FlashInfer's
-#        per-process AllReduce IPC port; the loser gets EADDRINUSE, the
-#        pass marks itself disabled, but the already-emitted graph nodes
-#        still call into the workspace -> assert during CUDA-graph warmup
-#        (`Flashinfer workspace must be initialized when using flashinfer`).
-#        Disabling the fuse pass avoids the contested port entirely.
-#        Tunji's verl recipe doesn't trip this because it co-locates one
-#        sampling replica per node.
-#   Spec-dec: speculative_config={method: arctic, model: <path>, ...}.
+# trainer.arctic_rl.arctic_inference_config. Uses the current
+# ``arctic_inference.server.config.ModelConfig`` API (>= the
+# ``arctic_inference`` shipping in this PR's lockfile):
+#   use_fca: true            -> FCA on (Arctic translates this into
+#                                forest_cascade_attn_configs="{}" +
+#                                compilation_config={cudagraph_mode: PIECEWISE}
+#                                in to_engine_kwargs).
+#   spec_model: <path>       -> Arctic Speculative Decoding on
+#                                (translated into speculative_config below).
+#   compilation_config.pass_config.fuse_allreduce_rms=false: with 8 replicas
+#                              x TP=4 colocated 2-per-node, the two co-located
+#                              replicas race for FlashInfer's per-process
+#                              AllReduce IPC port; loser gets EADDRINUSE, pass
+#                              marks itself disabled, but the already-emitted
+#                              graph nodes still call into the workspace ->
+#                              assert during CUDA-graph warmup
+#                              (`Flashinfer workspace must be initialized`).
+#                              Tunji's verl recipe doesn't trip this because
+#                              it colocates one sampling replica per node.
 #
-# These nested dicts are routed to vLLM by integrations.arctic_rl.config,
-# which round-trips them through OmegaConf.to_container so AsyncEngineArgs
-# sees plain dicts (the nested-override hook uses `isinstance(_, dict)`,
-# which is False for omegaconf.DictConfig and silently drops the value).
-# Same idiom as arctic-verl/verl/workers/remote_client/arctic_rl.py.
-#
-# KNOWN ISSUE (open, see follow-up): the OmegaConf round-trip alone is
-# *not* sufficient end-to-end in this checkout — the nested
-# compilation_config is still being dropped somewhere between
-# ArcticRLClientConfig and AsyncEngineArgs.__post_init__ (vLLM resolves
-# cudagraph_mode=FULL_AND_PIECEWISE and fuse_allreduce_rms=True at engine
-# init, even with this override set). Until that plumbing is traced and
-# fixed end-to-end, we pin optimization_level=1 below — that hard-codes
-# fuse_allreduce_rms=false inside vLLM, which empirically reproduced the
-# Jun 24 (skyrl_v1) 2x speedup baseline and is what unblocks TP>1 + Hopper
-# from the FlashInfer-workspace assertion.
+# These are routed to vLLM by integrations.arctic_rl.config, which
+# round-trips arctic_inference_config through OmegaConf.to_container so
+# AsyncEngineArgs sees plain dicts (the nested-override hook uses
+# `isinstance(_, dict)`, which is False for omegaconf.DictConfig and silently
+# drops the value). Same idiom as
+# arctic-verl/verl/workers/remote_client/arctic_rl.py.
 #
 # Flow-style dict values need a space after every `:` — OmegaConf.from_cli
 # runs yaml.load on each rhs (Hydra's CLI parser is more lenient).
@@ -126,12 +112,11 @@ NUM_SPEC_TOKENS=${NUM_SPEC_TOKENS:-3}
 
 AI_CFG_PARTS=()
 if [[ "${USE_FCA}" == "True" ]]; then
-    AI_CFG_PARTS+=('forest_cascade_attn_configs: "{}"')
-    AI_CFG_PARTS+=('optimization_level: 1')
-    AI_CFG_PARTS+=('compilation_config: {cudagraph_mode: PIECEWISE, pass_config: {fuse_allreduce_rms: false}}')
+    AI_CFG_PARTS+=('use_fca: true')
+    AI_CFG_PARTS+=('compilation_config: {pass_config: {fuse_allreduce_rms: false}}')
 fi
 if [[ -n "${SPEC_MODEL}" && -d "${SPEC_MODEL}" ]]; then
-    AI_CFG_PARTS+=("speculative_config: {method: arctic, model: ${SPEC_MODEL}, num_speculative_tokens: ${NUM_SPEC_TOKENS}}")
+    AI_CFG_PARTS+=("spec_model: ${SPEC_MODEL}")
 fi
 
 AI_CFG_OVERRIDE=()

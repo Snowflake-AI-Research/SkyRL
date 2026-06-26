@@ -19,27 +19,14 @@ DATA_DIR=${DATA_DIR:-"$HOME/data/bird"}
 PYBIN=${PYBIN:-python}
 ATTN_IMPL=${ATTN_IMPL:-flash_attention_2}
 
-export PYTHONUNBUFFERED=1
-export HYDRA_FULL_ERROR=1
-export RAY_DEDUP_LOGS=0
-export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
-export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}"
-export TORCH_COMPILE_DISABLE=1
-export VLLM_DISABLE_COMPILE_CACHE=1
-# Also disable torch.inductor's on-disk cache; see 32B launcher for the
-# stale-compiled-graph rationale.
-export TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
-export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$HOME/.cache/vllm}"
-export VLLM_LOGGING_LEVEL=INFO
+# Recipe-required env vars (skyrl + arctic). See 32B launcher for rationale.
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
+export TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
 export ARCTIC_CUDA_IPC_LOW_MEM=0
 export ARCTIC_WEIGHT_SYNC_STRICT_NAMES=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_PROJECT="${WANDB_PROJECT:-skyrl_arctic_rl}"
-export WANDB_DISABLE_CODE=True
 
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
 echo "MODEL=${MODEL}"
@@ -80,21 +67,20 @@ NUM_SPEC_TOKENS=${NUM_SPEC_TOKENS:-3}
 
 AI_CFG_PARTS=()
 if [[ "${USE_FCA}" == "True" ]]; then
-    AI_CFG_PARTS+=('forest_cascade_attn_configs: "{}"')
-    # Pin vLLM optimization to O1 so its compile pipeline hardcodes
-    # fuse_allreduce_rms=false. We *also* request it explicitly via
-    # compilation_config below, but in this environment the nested override
-    # from arctic_rl -> arctic_platform -> AsyncEngineArgs is being dropped
-    # before vLLM sees it (cudagraph_mode resolves to the default
-    # FULL_AND_PIECEWISE and fuse_allreduce_rms to True at engine init).
-    # Until that plumbing is fixed end-to-end, O1 is the reliable knob that
-    # avoids the FlashInfer-workspace assertion on TP>1 + Hopper. See
-    # docs/arctic_rl_speedup_investigation.md (TODO) for the open thread.
-    AI_CFG_PARTS+=('optimization_level: 1')
-    AI_CFG_PARTS+=('compilation_config: {cudagraph_mode: PIECEWISE, pass_config: {fuse_allreduce_rms: false}}')
+    # Current arctic_inference API: use_fca (bool) replaces the old
+    # forest_cascade_attn_configs string field. Arctic's to_engine_kwargs
+    # translates use_fca=true into forest_cascade_attn_configs="{}" +
+    # compilation_config={cudagraph_mode: PIECEWISE}.
+    AI_CFG_PARTS+=('use_fca: true')
+    # Disable the fuse_allreduce_rms pass: with multiple TP=4 replicas
+    # colocated per node, the per-process FlashInfer IPC AllReduce
+    # workspace port races, and the loser hits the
+    # `Flashinfer workspace must be initialized` assert during CUDA-graph
+    # warm-up. See 32B launcher for the full rationale.
+    AI_CFG_PARTS+=('compilation_config: {pass_config: {fuse_allreduce_rms: false}}')
 fi
 if [[ -n "${SPEC_MODEL}" && -d "${SPEC_MODEL}" ]]; then
-    AI_CFG_PARTS+=("speculative_config: {method: arctic, model: ${SPEC_MODEL}, num_speculative_tokens: ${NUM_SPEC_TOKENS}}")
+    AI_CFG_PARTS+=("spec_model: ${SPEC_MODEL}")
 fi
 
 AI_CFG_OVERRIDE=()
