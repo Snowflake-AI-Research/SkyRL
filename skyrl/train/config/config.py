@@ -346,7 +346,7 @@ class AlgorithmConfig(BaseConfig):
     temperature: Optional[float] = None
     """Temperature for scaling logits in policy loss computation.
     If ``None``, will be set to the temperature provided by ``generator.sampling_params.temperature`` during config validation.
-    
+
     NOTE: When using HTTP endpoints directly, make sure to set this value to the temperature used during generation
     """
     advantage_batch_normalize: bool = False
@@ -465,7 +465,7 @@ class InferenceEngineConfig(BaseConfig):
     remote_urls: List[str] = field(default_factory=lambda: [])
     enable_http_endpoint: bool = False
     """When ``True``, launch an OpenAI-compatible HTTP endpoint for the inference engine client so that generators can send requests to this server instead of using ``.generate()`` Python calls.
-    
+
     NOTE: When using HTTP endpoints directly, make sure to set ``trainer.algorithm.temperature`` to the temperature used during generation
     """
     http_endpoint_host: str = "127.0.0.1"
@@ -475,7 +475,7 @@ class InferenceEngineConfig(BaseConfig):
     ``/chat/completions`` requests instead of the model path. If ``None``, the model path is used."""
     distributed_executor_backend: str = "ray"
     """Distributed executor backend for vLLM. Set to ``"ray"`` to use the Ray backend
-    or ``"mp"`` to use the multiprocessing backend (single-node serving only). Per-engine 
+    or ``"mp"`` to use the multiprocessing backend (single-node serving only). Per-engine
     placement groups are created when ``"mp"`` is used."""
     language_model_only: bool = False
     """When True, pass ``language_model_only=True`` to the vLLM engine so that
@@ -633,6 +633,14 @@ class TrainerConfig(BaseConfig):
     dump_eval_results: bool = True
     rope_scaling: Optional[Dict[str, Any]] = None
     rope_theta: Optional[float] = None
+
+    override_entrypoint: Optional[str] = None
+    """Dotted module path to an integration's entrypoint
+    (e.g. ``integrations.arctic_rl.entrypoint``). When set, ``main_base.main()``
+    peeks this from the CLI before strict config parsing and dispatches to
+    ``<module>.main()``, letting the integration parse its own extended config
+    (typically via ``make_config(trainer_cls=<ext>)``). ``None`` (default) runs
+    the standard in-process SkyRL path."""
 
     def __post_init__(self):
         # ref model defaults to the policy model
